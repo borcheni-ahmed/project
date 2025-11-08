@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import time
 from collections import deque
+from threading import Thread, Lock
 
 # ----------------------------
 # Motor control functions
@@ -29,99 +30,139 @@ class Config:
     # Camera settings
     FRAME_WIDTH = 640
     FRAME_HEIGHT = 480
-    
-    # Color correction
-    BRIGHTNESS_ADJUST = 30
-    CONTRAST_ADJUST = 1.3
-    SATURATION_ADJUST = 1.2
+    FPS = 30
     
     # Obstacle detection
-    MIN_OBSTACLE_AREA = 1200
-    MAX_OBSTACLE_AREA = 100000
-    CRITICAL_DISTANCE_THRESHOLD = 30000  # Area-based
-    SAFE_DISTANCE_THRESHOLD = 15000
+    MIN_OBSTACLE_AREA = 1000
+    MAX_OBSTACLE_AREA = 80000
+    CRITICAL_DISTANCE_THRESHOLD = 25000
+    SAFE_DISTANCE_THRESHOLD = 12000
     
     # ROI settings
     ROI_TOP_RATIO = 0.35
     ROI_BOTTOM_RATIO = 0.95
     
-    # Motion detection sensitivity
-    MOTION_THRESHOLD = 25
-    MIN_MOTION_AREA = 500
-    
     # Traffic light detection (strict)
-    MIN_CIRCULARITY = 0.7  # To detect circular lights
-    MIN_LIGHT_AREA = 200
-    MAX_LIGHT_AREA = 5000
-    VERTICAL_ARRANGEMENT_TOLERANCE = 50  # pixels
+    MIN_CIRCULARITY = 0.65
+    MIN_LIGHT_AREA = 150
+    MAX_LIGHT_AREA = 4000
     
     # History for stability
     OBSTACLE_HISTORY_SIZE = 3
-    LIGHT_HISTORY_SIZE = 4
+    LIGHT_HISTORY_SIZE = 3
+    
+    # Performance
+    SKIP_FRAMES = 1  # Process every N frames
 
 # ----------------------------
-# Camera color correction
+# Threaded camera capture for better performance
 # ----------------------------
-def correct_colors(frame):
-    """Apply color correction to improve camera output"""
-    # Convert to LAB color space for better color correction
+class ThreadedCamera:
+    def __init__(self, width=640, height=480):
+        self.picam2 = Picamera2()
+        
+        # Optimized configuration
+        config = self.picam2.create_preview_configuration(
+            main={"size": (width, height), "format": "RGB888"},
+            buffer_count=2,  # Reduce buffer for less latency
+            controls={
+                "AwbEnable": True,
+                "AeEnable": True,
+                "FrameRate": Config.FPS,
+            }
+        )
+        self.picam2.configure(config)
+        self.picam2.start()
+        
+        self.frame = None
+        self.lock = Lock()
+        self.running = True
+        
+        # Start capture thread
+        self.thread = Thread(target=self._update, daemon=True)
+        self.thread.start()
+        
+        # Warm up
+        time.sleep(2)
+    
+    def _update(self):
+        """Continuously capture frames in background"""
+        while self.running:
+            try:
+                new_frame = self.picam2.capture_array()
+                with self.lock:
+                    # Convert RGB to BGR (OpenCV format) - THIS FIXES COLOR SWAP!
+                    self.frame = cv2.cvtColor(new_frame, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"[CAMERA ERROR] {e}")
+                time.sleep(0.1)
+    
+    def read(self):
+        """Get latest frame"""
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+    
+    def release(self):
+        """Stop camera"""
+        self.running = False
+        self.thread.join()
+        self.picam2.stop()
+
+# ----------------------------
+# Fast color correction
+# ----------------------------
+def correct_colors_fast(frame):
+    """Lightweight color correction"""
+    # Simple brightness and contrast adjustment
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     
-    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    # Fast CLAHE
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     
-    # Merge and convert back
     lab = cv2.merge([l, a, b])
     corrected = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    
-    # Additional adjustments
-    corrected = cv2.convertScaleAbs(corrected, alpha=Config.CONTRAST_ADJUST, 
-                                    beta=Config.BRIGHTNESS_ADJUST)
-    
-    # Increase saturation
-    hsv = cv2.cvtColor(corrected, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    s = cv2.convertScaleAbs(s, alpha=Config.SATURATION_ADJUST, beta=0)
-    hsv = cv2.merge([h, s, v])
-    corrected = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     
     return corrected
 
 # ----------------------------
-# Precise obstacle detection
+# Optimized obstacle detection
 # ----------------------------
-class ObstacleDetector:
+class FastObstacleDetector:
     def __init__(self):
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=16, detectShadows=False
+            history=300, varThreshold=25, detectShadows=False
         )
-        self.prev_gray = None
+        self.frame_count = 0
         
     def detect(self, frame):
-        """Detect obstacles using multiple methods"""
+        """Lightweight obstacle detection"""
+        self.frame_count += 1
+        
         h, w = frame.shape[:2]
         roi_top = int(h * Config.ROI_TOP_RATIO)
         roi_bottom = int(h * Config.ROI_BOTTOM_RATIO)
         
-        # Focus on road area
         roi = frame[roi_top:roi_bottom, :]
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Method 1: Edge detection
-        edges = self._detect_edges(gray_roi)
+        # Convert to grayscale
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Method 2: Background subtraction (motion-based)
-        motion_mask = self._detect_motion(roi)
+        # Method 1: Simple edge detection (fast)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 40, 120)
         
-        # Combine both methods
-        combined = cv2.bitwise_or(edges, motion_mask)
+        # Method 2: Background subtraction
+        fg_mask = self.bg_subtractor.apply(roi, learningRate=0.005)
+        _, motion = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
         
-        # Morphological operations to clean up
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        # Combine
+        combined = cv2.bitwise_or(edges, motion)
+        
+        # Quick morphological cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
         
         # Find contours
         contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, 
@@ -134,15 +175,16 @@ class ObstacleDetector:
             if Config.MIN_OBSTACLE_AREA < area < Config.MAX_OBSTACLE_AREA:
                 x, y, w_rect, h_rect = cv2.boundingRect(contour)
                 
-                # Filter by aspect ratio (reject very wide/thin objects)
-                aspect_ratio = w_rect / float(h_rect) if h_rect > 0 else 0
-                if 0.2 < aspect_ratio < 5.0:
-                    # Calculate center position
+                # Quick aspect ratio check
+                aspect = w_rect / float(h_rect) if h_rect > 0 else 0
+                if 0.2 < aspect < 5.0:
                     cx = x + w_rect // 2
                     cy = y + h_rect // 2
                     
-                    # Obstacle criticality based on area and position
-                    criticality = self._calculate_criticality(area, cy, roi.shape[0])
+                    # Simple criticality
+                    area_score = min(100, (area / Config.CRITICAL_DISTANCE_THRESHOLD) * 100)
+                    position_score = ((roi.shape[0] - cy) / roi.shape[0]) * 100
+                    criticality = (area_score * 0.7) + (position_score * 0.3)
                     
                     obstacles.append({
                         'bbox': (x, y + roi_top, w_rect, h_rect),
@@ -151,155 +193,88 @@ class ObstacleDetector:
                         'criticality': criticality
                     })
         
-        # Sort by criticality (most critical first)
         obstacles.sort(key=lambda x: x['criticality'], reverse=True)
-        
-        return obstacles, combined
-    
-    def _detect_edges(self, gray):
-        """Detect edges with adaptive thresholding"""
-        # Bilateral filter to reduce noise while keeping edges
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-        
-        # Adaptive thresholding
-        thresh = cv2.adaptiveThreshold(filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 11, 2)
-        
-        # Canny edge detection
-        edges = cv2.Canny(filtered, 50, 150)
-        
-        # Combine both
-        combined = cv2.bitwise_or(thresh, edges)
-        
-        return combined
-    
-    def _detect_motion(self, roi):
-        """Detect moving obstacles"""
-        # Apply background subtraction
-        fg_mask = self.bg_subtractor.apply(roi, learningRate=0.01)
-        
-        # Threshold to get binary mask
-        _, motion_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-        
-        return motion_mask
-    
-    def _calculate_criticality(self, area, y_pos, roi_height):
-        """Calculate how critical an obstacle is (0-100)"""
-        # Larger objects are more critical
-        area_score = min(100, (area / Config.CRITICAL_DISTANCE_THRESHOLD) * 100)
-        
-        # Lower position (closer to car) is more critical
-        position_score = ((roi_height - y_pos) / roi_height) * 100
-        
-        # Weighted combination
-        criticality = (area_score * 0.7) + (position_score * 0.3)
-        
-        return criticality
+        return obstacles[:5]  # Return top 5 only
 
 # ----------------------------
-# Traffic light detection (strict)
+# Fixed traffic light detection
 # ----------------------------
-class TrafficLightDetector:
+class FastTrafficLightDetector:
     def __init__(self):
         self.light_history = deque(maxlen=Config.LIGHT_HISTORY_SIZE)
         
     def detect(self, frame):
-        """Detect traffic lights only if they look like actual traffic lights"""
+        """Detect traffic lights with CORRECT BGR colors"""
         h, w = frame.shape[:2]
+        roi = frame[0:h//2, w//4:3*w//4]  # Focus on center-top
         
-        # Focus on upper portion where traffic lights are
-        roi = frame[0:h//2, :]
+        # Convert BGR to HSV
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         
-        # Detect colored circles (traffic lights are circular)
-        red_lights = self._find_circular_lights(hsv, "RED")
-        orange_lights = self._find_circular_lights(hsv, "ORANGE")
-        green_lights = self._find_circular_lights(hsv, "GREEN")
+        # Detect each color
+        red_score = self._detect_color(hsv, "RED")
+        orange_score = self._detect_color(hsv, "ORANGE")
+        green_score = self._detect_color(hsv, "GREEN")
         
-        # Check if lights are vertically arranged (typical traffic light pattern)
+        # Determine which light is active
         detected_state = None
-        if red_lights or orange_lights or green_lights:
-            if self._is_traffic_light_arrangement(red_lights, orange_lights, green_lights):
-                if red_lights:
-                    detected_state = "RED"
-                elif orange_lights:
-                    detected_state = "ORANGE"
-                elif green_lights:
-                    detected_state = "GREEN"
+        max_score = max(red_score, orange_score, green_score)
         
-        # Add to history for stability
+        if max_score > 200:  # Minimum pixels threshold
+            if red_score == max_score:
+                detected_state = "RED"
+            elif orange_score == max_score:
+                detected_state = "ORANGE"
+            elif green_score == max_score:
+                detected_state = "GREEN"
+        
+        # Add to history
         self.light_history.append(detected_state)
         
-        # Return only if detected consistently
-        if len(self.light_history) >= 3:
-            non_none = [s for s in self.light_history if s is not None]
-            if len(non_none) >= 2 and len(set(non_none)) == 1:
+        # Return only if consistent
+        if len(self.light_history) >= 2:
+            non_none = [s for s in list(self.light_history)[-2:] if s is not None]
+            if len(non_none) >= 2 and non_none[0] == non_none[1]:
                 return non_none[0]
         
         return None
     
-    def _find_circular_lights(self, hsv, color):
-        """Find circular colored objects (potential traffic lights)"""
+    def _detect_color(self, hsv, color):
+        """Detect specific color and check circularity"""
         if color == "RED":
+            # Red wraps around in HSV (0-10 and 170-180)
             mask1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([160, 100, 100]), np.array([180, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255]))
             mask = cv2.bitwise_or(mask1, mask2)
         elif color == "ORANGE":
-            mask = cv2.inRange(hsv, np.array([8, 100, 100]), np.array([25, 255, 255]))
+            # Orange/Yellow range
+            mask = cv2.inRange(hsv, np.array([10, 100, 100]), np.array([25, 255, 255]))
         else:  # GREEN
-            mask = cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255]))
+            mask = cv2.inRange(hsv, np.array([40, 50, 50]), np.array([80, 255, 255]))
         
-        # Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        # Clean up mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         
-        # Find contours
+        # Find circular contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        lights = []
+        total_score = 0
         for contour in contours:
             area = cv2.contourArea(contour)
             
             if Config.MIN_LIGHT_AREA < area < Config.MAX_LIGHT_AREA:
-                # Check circularity
                 perimeter = cv2.arcLength(contour, True)
-                if perimeter == 0:
-                    continue
-                circularity = 4 * np.pi * area / (perimeter * perimeter)
-                
-                if circularity > Config.MIN_CIRCULARITY:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    lights.append({'bbox': (x, y, w, h), 'area': area})
+                if perimeter > 0:
+                    circularity = 4 * np.pi * area / (perimeter * perimeter)
+                    
+                    if circularity > Config.MIN_CIRCULARITY:
+                        total_score += area
         
-        return lights
-    
-    def _is_traffic_light_arrangement(self, red, orange, green):
-        """Check if detected lights are arranged like a traffic light"""
-        all_lights = red + orange + green
-        
-        if len(all_lights) < 1:
-            return False
-        
-        # If only one light detected, check if it's reasonably sized
-        if len(all_lights) == 1:
-            return True
-        
-        # If multiple lights, check vertical arrangement
-        centers_y = [bbox[1] + bbox[3]//2 for _, bbox in 
-                     [(l, l['bbox']) for l in all_lights]]
-        
-        # Check if there's vertical spacing between lights
-        centers_y.sort()
-        for i in range(len(centers_y) - 1):
-            spacing = centers_y[i+1] - centers_y[i]
-            if Config.VERTICAL_ARRANGEMENT_TOLERANCE < spacing < 200:
-                return True
-        
-        return False
+        return total_score
 
 # ----------------------------
-# Obstacle tracking with history
+# Obstacle tracker
 # ----------------------------
 class ObstacleTracker:
     def __init__(self, history_size=3):
@@ -309,18 +284,16 @@ class ObstacleTracker:
         self.history.append(obstacles)
     
     def get_stable_obstacles(self):
-        """Return obstacles that appear consistently"""
         if len(self.history) < 2:
             return []
         
-        # Return most recent obstacles if they're consistent
         if all(len(obs) > 0 for obs in self.history):
             return self.history[-1]
         
         return []
 
 # ----------------------------
-# Motor controller with precise logic
+# Motor controller
 # ----------------------------
 class MotorController:
     def __init__(self):
@@ -329,38 +302,35 @@ class MotorController:
         self.last_avoidance_time = 0
         
     def decide(self, obstacles, traffic_light):
-        """Make driving decision based on inputs"""
         current_time = time.time()
         
-        # Priority 1: Red traffic light
+        # Red light = stop
         if traffic_light == "RED":
             self._execute_stop()
             return
         
-        # Priority 2: Critical obstacle
-        if obstacles and len(obstacles) > 0:
+        # Critical obstacle
+        if obstacles:
             most_critical = obstacles[0]
             
             if most_critical['criticality'] > 60:
-                # Very close obstacle - avoid
                 if current_time - self.last_avoidance_time > 2.0:
                     self._execute_avoidance(most_critical)
                     self.last_avoidance_time = current_time
                 return
             
             elif most_critical['criticality'] > 35:
-                # Medium distance - slow down/stop
                 self._execute_stop()
                 return
         
-        # Priority 3: Orange light - prepare to stop
+        # Orange light
         if traffic_light == "ORANGE":
             self._execute_stop()
             return
         
-        # Priority 4: Green light or clear road - go forward
+        # Green or clear - go
         if traffic_light == "GREEN" or traffic_light is None:
-            if not obstacles or len(obstacles) == 0:
+            if not obstacles:
                 self._execute_forward()
     
     def _execute_stop(self):
@@ -374,77 +344,68 @@ class MotorController:
             self.state = "FORWARD"
     
     def _execute_avoidance(self, obstacle):
-        """Smart avoidance based on obstacle position"""
         cx = obstacle['center'][0]
         frame_center = Config.FRAME_WIDTH // 2
         
-        print(f"[AVOIDANCE] Obstacle criticality: {obstacle['criticality']:.1f}")
+        print(f"[AVOIDANCE] Criticality: {obstacle['criticality']:.1f}")
         
         stop()
         time.sleep(0.2)
         
-        # Steer away from obstacle position
         if cx < frame_center:
-            # Obstacle on left, go right
             right()
-            print("[AVOIDANCE] Obstacle on left, steering RIGHT")
+            print("[AVOIDANCE] Steering RIGHT")
         else:
-            # Obstacle on right, go left
             left()
-            print("[AVOIDANCE] Obstacle on right, steering LEFT")
+            print("[AVOIDANCE] Steering LEFT")
         
         time.sleep(0.4)
         stop()
         self.state = "STOP"
-        self.avoidance_count += 1
 
 # ----------------------------
-# Main function
+# Main function (optimized)
 # ----------------------------
 def main():
-    # Initialize camera with manual settings for better color
-    picam2 = Picamera2()
+    # Initialize threaded camera
+    print("[SYSTEM] Starting threaded camera...")
+    camera = ThreadedCamera(Config.FRAME_WIDTH, Config.FRAME_HEIGHT)
     
-    # Configure camera
-    config = picam2.create_preview_configuration(
-        main={"size": (Config.FRAME_WIDTH, Config.FRAME_HEIGHT), "format": "RGB888"},
-        controls={
-            "AwbEnable": True,  # Auto white balance
-            "AeEnable": True,   # Auto exposure
-            "Brightness": 0.0,
-            "Contrast": 1.0,
-            "Saturation": 1.2
-        }
-    )
-    picam2.configure(config)
-    picam2.start()
-    
-    # Warm-up period
-    print("[SYSTEM] Camera warming up...")
-    time.sleep(3)
-    
-    # Initialize components
-    obstacle_detector = ObstacleDetector()
-    traffic_light_detector = TrafficLightDetector()
+    # Initialize detectors
+    obstacle_detector = FastObstacleDetector()
+    traffic_light_detector = FastTrafficLightDetector()
     obstacle_tracker = ObstacleTracker(Config.OBSTACLE_HISTORY_SIZE)
     motor_controller = MotorController()
     
     print("[SYSTEM] ============================================")
-    print("[SYSTEM] ADAS System Started")
+    print("[SYSTEM] ADAS System Started (Optimized)")
+    print("[SYSTEM] BGR Color Fix Applied")
     print("[SYSTEM] Press 'q' to quit, 's' to save frame")
     print("[SYSTEM] ============================================")
     
     frame_count = 0
+    fps_start_time = time.time()
+    fps_counter = 0
+    current_fps = 0
     
     try:
         while True:
-            # Capture and correct frame
-            frame = picam2.capture_array()
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            corrected_frame = correct_colors(frame)
+            # Get frame from threaded camera
+            frame = camera.read()
+            if frame is None:
+                continue
+            
+            frame_count += 1
+            
+            # Process every N frames for better performance
+            if frame_count % (Config.SKIP_FRAMES + 1) != 0:
+                continue
+            
+            # Light color correction
+            corrected_frame = correct_colors_fast(frame)
             
             # Detect obstacles
-            obstacles, debug_mask = obstacle_detector.detect(corrected_frame)
+            obstacles = obstacle_detector.detect(corrected_frame)
             obstacle_tracker.update(obstacles)
             stable_obstacles = obstacle_tracker.get_stable_obstacles()
             
@@ -453,75 +414,75 @@ def main():
             
             # Draw obstacles
             display_frame = corrected_frame.copy()
-            for i, obs in enumerate(stable_obstacles):
+            for obs in stable_obstacles:
                 x, y, w, h = obs['bbox']
                 criticality = obs['criticality']
                 
                 # Color based on criticality
                 if criticality > 60:
-                    color = (0, 0, 255)  # Red - critical
+                    color = (0, 0, 255)  # Red
                 elif criticality > 35:
-                    color = (0, 165, 255)  # Orange - warning
+                    color = (0, 165, 255)  # Orange
                 else:
-                    color = (0, 255, 255)  # Yellow - detected
+                    color = (0, 255, 255)  # Yellow
                 
                 cv2.rectangle(display_frame, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(display_frame, f"C:{criticality:.0f}", (x, y-10),
+                cv2.putText(display_frame, f"{criticality:.0f}%", (x, y-5),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
-            # Draw traffic light status
+            # Draw traffic light
             if traffic_light:
                 tl_color = (0, 0, 255) if traffic_light == "RED" else \
                           (0, 165, 255) if traffic_light == "ORANGE" else (0, 255, 0)
-                cv2.putText(display_frame, f"TRAFFIC: {traffic_light}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, tl_color, 2)
+                cv2.circle(display_frame, (30, 30), 15, tl_color, -1)
+                cv2.putText(display_frame, traffic_light, (55, 38),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_color, 2)
             
-            # Draw ROI lines
+            # Draw ROI
             h = display_frame.shape[0]
             roi_top = int(h * Config.ROI_TOP_RATIO)
-            roi_bottom = int(h * Config.ROI_BOTTOM_RATIO)
             cv2.line(display_frame, (0, roi_top), (Config.FRAME_WIDTH, roi_top), 
                     (255, 0, 0), 1)
-            cv2.line(display_frame, (0, roi_bottom), (Config.FRAME_WIDTH, roi_bottom), 
-                    (255, 0, 0), 1)
             
-            # Status info
-            obstacle_count = len(stable_obstacles)
-            cv2.putText(display_frame, f"Obstacles: {obstacle_count}", (10, 60),
+            # FPS calculation
+            fps_counter += 1
+            if time.time() - fps_start_time > 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_start_time = time.time()
+            
+            # Status overlay
+            cv2.putText(display_frame, f"FPS: {current_fps}", (10, h-60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(display_frame, f"Obstacles: {len(stable_obstacles)}", (10, h-35),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(display_frame, f"State: {motor_controller.state}", (10, 90),
+            cv2.putText(display_frame, f"State: {motor_controller.state}", (10, h-10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            # Make driving decision
+            # Make decision
             motor_controller.decide(stable_obstacles, traffic_light)
             
-            # Display frames
-            cv2.imshow("ADAS - Main View", display_frame)
+            # Display
+            cv2.imshow("ADAS - Optimized View", display_frame)
             
-            # Show debug mask (smaller window)
-            if debug_mask is not None:
-                debug_resized = cv2.resize(debug_mask, (320, 240))
-                cv2.imshow("ADAS - Detection Mask", debug_resized)
-            
-            # Handle keyboard input
+            # Keyboard
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("\n[SYSTEM] Shutting down...")
                 break
             elif key == ord('s'):
-                cv2.imwrite(f"adas_frame_{frame_count}.jpg", display_frame)
-                print(f"[SYSTEM] Frame saved: adas_frame_{frame_count}.jpg")
-            
-            frame_count += 1
+                filename = f"adas_{int(time.time())}.jpg"
+                cv2.imwrite(filename, display_frame)
+                print(f"[SYSTEM] Saved: {filename}")
             
     except KeyboardInterrupt:
-        print("\n[SYSTEM] Interrupted by user")
+        print("\n[SYSTEM] Interrupted")
     except Exception as e:
         print(f"\n[ERROR] {e}")
         import traceback
         traceback.print_exc()
     finally:
-        picam2.stop()
+        camera.release()
         cv2.destroyAllWindows()
         stop()
         print("[SYSTEM] Cleanup complete")
