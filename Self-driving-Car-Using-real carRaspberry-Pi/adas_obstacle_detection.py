@@ -4,601 +4,412 @@ import numpy as np
 import time
 from collections import deque
 from threading import Thread, Lock
+import serial
 
 # ----------------------------
-# Motor control functions
+# Motor control (with serial to Arduino)
 # ----------------------------
-def stop():
-    print("[MOTORS] STOP")
+class MotorController:
+    def __init__(self, port="/dev/ttyACM0", baud=9600):
+        self.state = "STOP"
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            time.sleep(2)  # Wait for Arduino reset
+            print("[SERIAL] Connected to Arduino.")
+        except Exception as e:
+            print(f"[ERROR] Serial connection failed: {e}")
+            self.ser = None
 
-def forward():
-    print("[MOTORS] FORWARD")
+    def _send(self, cmd):
+        print(f"[MOTORS] {cmd}")
+        if self.ser:
+            try:
+                self.ser.write((cmd + "\n").encode())
+            except Exception as e:
+                print(f"[SERIAL ERROR] {e}")
 
-def left():
-    print("[MOTORS] LEFT")
+    def stop(self):
+        if self.state != "STOP":
+            self._send("STOP")
+            self.state = "STOP"
 
-def right():
-    print("[MOTORS] RIGHT")
+    def forward(self):
+        if self.state != "FORWARD":
+            self._send("FORWARD")
+            self.state = "FORWARD"
 
-def backward():
-    print("[MOTORS] BACKWARD")
+    def left(self):
+        if self.state != "LEFT":
+            self._send("LEFT")
+            self.state = "LEFT"
+
+    def right(self):
+        if self.state != "RIGHT":
+            self._send("RIGHT")
+            self.state = "RIGHT"
+
+    def backward(self):
+        if self.state != "BACKWARD":
+            self._send("BACKWARD")
+            self.state = "BACKWARD"
 
 # ----------------------------
 # Configuration
 # ----------------------------
 class Config:
-    # Camera settings
     FRAME_WIDTH = 480
     FRAME_HEIGHT = 360
     FPS = 30
-    
-    # Obstacle detection (STRICT)
-    MIN_OBSTACLE_AREA = 1500  # Increased to filter noise
-    MAX_OBSTACLE_AREA = 50000
-    MIN_SOLIDITY = 0.3  # Object must be solid (not scattered pixels)
-    MIN_ASPECT_RATIO = 0.2
-    MAX_ASPECT_RATIO = 4.0
-    MIN_EXTENT = 0.3  # Portion of bounding box filled
-    
-    # Proximity thresholds
-    CRITICAL_PROXIMITY = 75
-    WARNING_PROXIMITY = 55
-    SAFE_PROXIMITY = 35
-    
-    # ROI settings
-    ROI_TOP_RATIO = 0.30
-    ROI_BOTTOM_RATIO = 0.92
-    ROI_LEFT_RATIO = 0.15  # Ignore edges
-    ROI_RIGHT_RATIO = 0.85
-    
-    # Traffic light detection
-    MIN_CIRCULARITY = 0.65
-    MIN_LIGHT_AREA = 150
-    MAX_LIGHT_AREA = 3000
-    
-    # Temporal filtering (STRICT)
-    OBSTACLE_HISTORY_SIZE = 4  # Must appear in 4 frames
-    MIN_DETECTIONS_REQUIRED = 3  # Must be detected 3/4 times
-    LIGHT_HISTORY_SIZE = 3
-    
-    # Performance
-    DETECTION_SCALE = 0.8
-    
-    # Edge rejection
-    EDGE_MARGIN = 20  # Ignore objects too close to frame edges
+
+    MIN_OBSTACLE_AREA = 150
+    MAX_OBSTACLE_AREA = 100000
+
+    CRITICAL_PROXIMITY = 45
+    WARNING_PROXIMITY = 30
+    SAFE_PROXIMITY = 15
+
+    ROI_TOP_RATIO = 0.05
+    ROI_BOTTOM_RATIO = 0.95
+    ROI_LEFT_RATIO = 0.05
+    ROI_RIGHT_RATIO = 0.95
+
+    OBSTACLE_HISTORY_SIZE = 3
+    MIN_DETECTIONS_REQUIRED = 2
 
 # ----------------------------
-# High-performance threaded camera
+# Threaded camera
 # ----------------------------
 class ThreadedCamera:
     def __init__(self, width=480, height=360):
         self.picam2 = Picamera2()
-        
         config = self.picam2.create_preview_configuration(
             main={"size": (width, height), "format": "RGB888"},
             buffer_count=2,
-            queue=False,
-            controls={
-                "AwbEnable": True,
-                "AeEnable": True,
-                "FrameRate": Config.FPS,
-                "NoiseReductionMode": 1,  # Minimal noise reduction
-            }
+            controls={"AwbEnable": True, "AeEnable": True, "FrameRate": Config.FPS}
         )
         self.picam2.configure(config)
         self.picam2.start()
-        
+        time.sleep(2)
         self.frame = None
         self.lock = Lock()
         self.running = True
-        
         self.thread = Thread(target=self._update, daemon=True)
         self.thread.start()
-        
-        time.sleep(2)
-    
+
     def _update(self):
         while self.running:
             try:
-                new_frame = self.picam2.capture_array()
-                bgr_frame = cv2.cvtColor(new_frame, cv2.COLOR_RGB2BGR)
+                frame = self.picam2.capture_array()
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 with self.lock:
-                    self.frame = bgr_frame
+                    self.frame = bgr
             except:
                 time.sleep(0.01)
-    
+
     def read(self):
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
-    
+
     def release(self):
         self.running = False
         self.thread.join()
         self.picam2.stop()
 
 # ----------------------------
-# Relative proximity estimation
+# Proximity estimator
 # ----------------------------
 class ProximityEstimator:
-    
     @staticmethod
     def calculate_proximity(bbox, area, frame_height, frame_width):
-        """Calculate proximity score (0-100, higher = closer/more dangerous)"""
         x, y, w, h = bbox
-        
-        # Factor 1: Object size (area)
         area_score = min(100, (area / Config.MAX_OBSTACLE_AREA) * 150)
-        
-        # Factor 2: Vertical position - lower in frame = closer
-        roi_height = frame_height * (Config.ROI_BOTTOM_RATIO - Config.ROI_TOP_RATIO)
-        roi_start = frame_height * Config.ROI_TOP_RATIO
-        normalized_y = (y - roi_start) / roi_height
+        normalized_y = (y + h / 2) / frame_height
         position_score = (1 - normalized_y) * 100
-        
-        # Factor 3: Width
-        width_score = min(100, (w / frame_width) * 200)
-        
-        # Weighted combination
+        width_score = min(100, (w / frame_width) * 100)
         proximity = (area_score * 0.5) + (position_score * 0.3) + (width_score * 0.2)
-        
-        return max(0, min(100, int(proximity)))
-    
+        return int(max(0, min(100, proximity)))
+
     @staticmethod
     def proximity_to_level(proximity):
-        """Convert proximity score to readable level"""
-        if proximity >= 75:
+        if proximity >= Config.CRITICAL_PROXIMITY:
             return "CRITICAL", (0, 0, 255)
-        elif proximity >= 55:
-            return "CLOSE", (0, 100, 255)
-        elif proximity >= 35:
-            return "MEDIUM", (0, 165, 255)
-        elif proximity >= 20:
-            return "FAR", (0, 255, 255)
+        elif proximity >= Config.WARNING_PROXIMITY:
+            return "CLOSE", (0, 165, 255)
+        elif proximity >= Config.SAFE_PROXIMITY:
+            return "MEDIUM", (0, 255, 255)
         else:
             return "SAFE", (0, 255, 0)
 
 # ----------------------------
-# High-accuracy obstacle detector
+# Enhanced all-object detector
 # ----------------------------
-class AccurateObstacleDetector:
+class EnhancedObstacleDetector:
     def __init__(self):
-        # Background subtractor with conservative settings
-        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500,  # Longer history for stability
-            varThreshold=50,  # Higher threshold = less sensitive
-            detectShadows=False
-        )
+        self.prev_gray = None
         self.kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        self.kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self.frame_count = 0
+        self.kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self.background_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=100, varThreshold=25, detectShadows=False
+        )
+
+    def _detect_edges(self, gray):
+        """Multi-scale edge detection for better obstacle boundaries"""
+        # Canny edge detection with multiple thresholds
+        edges1 = cv2.Canny(gray, 30, 90)
+        edges2 = cv2.Canny(gray, 50, 150)
+        edges = cv2.bitwise_or(edges1, edges2)
+        edges = cv2.dilate(edges, self.kernel_small, iterations=1)
+        return edges
+
+    def _detect_texture(self, gray):
+        """Detect texture changes that indicate objects"""
+        # Laplacian for texture detection
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        laplacian = np.uint8(np.absolute(laplacian))
+        _, texture_mask = cv2.threshold(laplacian, 20, 255, cv2.THRESH_BINARY)
+        return texture_mask
+
+    def _detect_depth_cues(self, gray):
+        """Use brightness and contrast for depth perception"""
+        # Adaptive thresholding to find objects with different brightness
+        adaptive = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 21, 5
+        )
         
+        # Also detect very dark and very bright regions
+        _, dark = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)
+        _, bright = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        
+        depth_mask = cv2.bitwise_or(adaptive, cv2.bitwise_or(dark, bright))
+        return depth_mask
+
+    def _detect_motion(self, frame, gray):
+        """Detect moving objects using background subtraction and frame differencing"""
+        # Background subtraction
+        fg_mask = self.background_subtractor.apply(frame)
+        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+        
+        # Frame differencing for fast motion
+        if self.prev_gray is not None:
+            diff = cv2.absdiff(gray, self.prev_gray)
+            _, motion_mask = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+            motion_combined = cv2.bitwise_or(fg_mask, motion_mask)
+        else:
+            motion_combined = fg_mask
+        
+        self.prev_gray = gray.copy()
+        return motion_combined
+
+    def _detect_contours_advanced(self, gray):
+        """Detect object contours using morphological operations"""
+        # Morphological gradient to find object boundaries
+        gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, self.kernel_small)
+        _, gradient_thresh = cv2.threshold(gradient, 30, 255, cv2.THRESH_BINARY)
+        
+        # Close gaps in boundaries
+        closed = cv2.morphologyEx(gradient_thresh, cv2.MORPH_CLOSE, self.kernel_large, iterations=2)
+        return closed
+
     def detect(self, frame):
-        """Accurate obstacle detection with strict filtering"""
         h, w = frame.shape[:2]
-        
-        # Define strict ROI (ignore edges and top)
         roi_top = int(h * Config.ROI_TOP_RATIO)
         roi_bottom = int(h * Config.ROI_BOTTOM_RATIO)
         roi_left = int(w * Config.ROI_LEFT_RATIO)
         roi_right = int(w * Config.ROI_RIGHT_RATIO)
-        
         roi = frame[roi_top:roi_bottom, roi_left:roi_right]
-        roi_h, roi_w = roi.shape[:2]
+
+        # Convert to grayscale and preprocess
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Downscale for processing
-        process_roi = cv2.resize(roi, None, fx=Config.DETECTION_SCALE, 
-                                fy=Config.DETECTION_SCALE, 
-                                interpolation=cv2.INTER_LINEAR)
-        scale_factor = 1.0 / Config.DETECTION_SCALE
+        # Apply CLAHE for better contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # MULTIPLE DETECTION METHODS
+        # 1. Edge detection (static objects with clear boundaries)
+        edges = self._detect_edges(enhanced)
         
-        # Convert to grayscale
-        gray = cv2.cvtColor(process_roi, cv2.COLOR_BGR2GRAY)
+        # 2. Texture detection (objects with different texture)
+        texture = self._detect_texture(enhanced)
         
-        # Method 1: Edge detection (for static objects)
-        # Use bilateral filter to preserve edges while removing noise
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-        edges = cv2.Canny(filtered, 40, 120)
+        # 3. Depth cues (objects with different brightness)
+        depth = self._detect_depth_cues(enhanced)
         
-        # Method 2: Background subtraction (for moving objects)
-        self.frame_count += 1
-        if self.frame_count > 30:  # Only after background model is learned
-            fg_mask = self.bg_subtractor.apply(process_roi, learningRate=0.001)
-            _, motion = cv2.threshold(fg_mask, 240, 255, cv2.THRESH_BINARY)
-        else:
-            motion = np.zeros_like(edges)
+        # 4. Motion detection (moving objects)
+        motion = self._detect_motion(roi, enhanced)
         
-        # Method 3: Adaptive thresholding for contrast objects
-        adaptive = cv2.adaptiveThreshold(filtered, 255, 
-                                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY_INV, 11, 3)
+        # 5. Contour-based detection (solid objects)
+        contours_mask = self._detect_contours_advanced(enhanced)
+
+        # COMBINE ALL METHODS
+        # Static detection (edges + texture + depth + contours)
+        static_combined = cv2.bitwise_or(edges, texture)
+        static_combined = cv2.bitwise_or(static_combined, depth)
+        static_combined = cv2.bitwise_or(static_combined, contours_mask)
         
-        # Combine methods - require at least 2/3 to agree
-        edge_motion = cv2.bitwise_and(edges, motion)
-        edge_adaptive = cv2.bitwise_and(edges, adaptive)
-        motion_adaptive = cv2.bitwise_and(motion, adaptive)
+        # Combine with motion
+        final_mask = cv2.bitwise_or(static_combined, motion)
         
-        # Combine overlaps
-        combined = cv2.bitwise_or(edge_motion, edge_adaptive)
-        combined = cv2.bitwise_or(combined, motion_adaptive)
+        # Clean up noise
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, self.kernel_small, iterations=1)
+        final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, self.kernel_large, iterations=2)
         
-        # Aggressive morphological cleanup
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, self.kernel_small, iterations=2)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, self.kernel_medium, iterations=1)
-        
-        # Remove small blobs
-        combined = cv2.erode(combined, self.kernel_small, iterations=1)
-        combined = cv2.dilate(combined, self.kernel_medium, iterations=2)
-        
+        # Fill holes in detected objects
+        final_mask = cv2.dilate(final_mask, self.kernel_small, iterations=1)
+
         # Find contours
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, 
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         obstacles = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            
-            # Strict area filtering
+        for c in contours:
+            area = cv2.contourArea(c)
             if area < Config.MIN_OBSTACLE_AREA or area > Config.MAX_OBSTACLE_AREA:
                 continue
             
             # Get bounding box
-            x, y, w_rect, h_rect = cv2.boundingRect(contour)
+            x, y, w_rect, h_rect = cv2.boundingRect(c)
             
-            # Calculate shape features for filtering
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
+            # Filter out noise (very thin or very wide objects)
+            aspect_ratio = w_rect / float(h_rect) if h_rect > 0 else 0
+            if aspect_ratio > 10 or aspect_ratio < 0.1:
                 continue
             
-            # 1. Solidity check (convex hull vs actual area)
-            hull = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            solidity = area / hull_area if hull_area > 0 else 0
-            
-            if solidity < Config.MIN_SOLIDITY:
-                continue  # Too scattered/noisy
-            
-            # 2. Aspect ratio check
-            aspect = w_rect / float(h_rect) if h_rect > 0 else 0
-            if aspect < Config.MIN_ASPECT_RATIO or aspect > Config.MAX_ASPECT_RATIO:
-                continue
-            
-            # 3. Extent check (area vs bounding box area)
-            bbox_area = w_rect * h_rect
-            extent = area / bbox_area if bbox_area > 0 else 0
-            
-            if extent < Config.MIN_EXTENT:
-                continue  # Too sparse
-            
-            # 4. Edge rejection - ignore objects at frame edges
-            if (x < Config.EDGE_MARGIN or 
-                y < Config.EDGE_MARGIN or 
-                x + w_rect > process_roi.shape[1] - Config.EDGE_MARGIN or
-                y + h_rect > process_roi.shape[0] - Config.EDGE_MARGIN):
-                continue
-            
-            # Scale back to original coordinates
-            x_orig = int(x * scale_factor) + roi_left
-            y_orig = int(y * scale_factor) + roi_top
-            w_orig = int(w_rect * scale_factor)
-            h_orig = int(h_rect * scale_factor)
+            # Map back to original frame coordinates
+            x_orig, y_orig = x + roi_left, y + roi_top
+            bbox = (x_orig, y_orig, w_rect, h_rect)
             
             # Calculate proximity
-            proximity = ProximityEstimator.calculate_proximity(
-                (x_orig, y_orig, w_orig, h_orig),
-                area * (scale_factor ** 2),
-                h, w
-            )
-            
-            # Calculate center
-            cx = x_orig + w_orig // 2
-            cy = y_orig + h_orig // 2
+            proximity = ProximityEstimator.calculate_proximity(bbox, area, h, w)
+            cx, cy = x_orig + w_rect // 2, y_orig + h_rect // 2
             
             obstacles.append({
-                'bbox': (x_orig, y_orig, w_orig, h_orig),
-                'area': area * (scale_factor ** 2),
-                'center': (cx, cy),
+                'bbox': bbox, 
+                'center': (cx, cy), 
                 'proximity': proximity,
-                'solidity': solidity,
-                'extent': extent,
-                'criticality': proximity
+                'area': area
             })
-        
-        # Sort by proximity
+
+        # Sort by proximity (closest first)
         obstacles.sort(key=lambda x: x['proximity'], reverse=True)
-        
-        return obstacles[:6], combined
+        return obstacles, final_mask
 
 # ----------------------------
-# Traffic light detector
-# ----------------------------
-class OptimizedTrafficLightDetector:
-    def __init__(self):
-        self.light_history = deque(maxlen=Config.LIGHT_HISTORY_SIZE)
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
-    def detect(self, frame):
-        """Detect traffic lights"""
-        h, w = frame.shape[:2]
-        roi = frame[0:h//3, w//3:2*w//3]
-        roi_small = cv2.resize(roi, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
-        hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
-        
-        scores = {
-            "RED": self._quick_detect(hsv, "RED"),
-            "ORANGE": self._quick_detect(hsv, "ORANGE"),
-            "GREEN": self._quick_detect(hsv, "GREEN")
-        }
-        
-        max_score = max(scores.values())
-        detected = None
-        
-        if max_score > 150:  # Higher threshold
-            detected = max(scores, key=scores.get)
-        
-        self.light_history.append(detected)
-        
-        if len(self.light_history) >= 2:
-            recent = list(self.light_history)[-2:]
-            non_none = [x for x in recent if x is not None]
-            if len(non_none) >= 2 and non_none[0] == non_none[1]:
-                return non_none[0]
-        
-        return None
-    
-    def _quick_detect(self, hsv, color):
-        if color == "RED":
-            mask1 = cv2.inRange(hsv, (0, 100, 100), (10, 255, 255))
-            mask2 = cv2.inRange(hsv, (170, 100, 100), (180, 255, 255))
-            mask = cv2.bitwise_or(mask1, mask2)
-        elif color == "ORANGE":
-            mask = cv2.inRange(hsv, (10, 100, 100), (25, 255, 255))
-        else:
-            mask = cv2.inRange(hsv, (40, 50, 50), (80, 255, 255))
-        
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
-        return cv2.countNonZero(mask)
-
-# ----------------------------
-# Strict temporal obstacle tracker
+# Obstacle tracker
 # ----------------------------
 class StrictObstacleTracker:
-    def __init__(self, history_size=4):
+    def __init__(self, history_size=3):
         self.history = deque(maxlen=history_size)
-        self.obstacle_tracks = {}  # Track obstacles by position
-        self.next_id = 0
-        
+
     def update(self, obstacles):
-        """Track obstacles over time with position matching"""
         self.history.append(obstacles)
-    
+
     def get_stable_obstacles(self):
-        """Return only obstacles that appear consistently"""
         if len(self.history) < Config.MIN_DETECTIONS_REQUIRED:
             return []
         
-        # Count how many times each obstacle position appears
         position_map = {}
+        for obs_list in self.history:
+            for obs in obs_list:
+                # Grid-based grouping for stable detection
+                gx, gy = round(obs['center'][0] / 30) * 30, round(obs['center'][1] / 30) * 30
+                position_map.setdefault((gx, gy), []).append(obs)
         
-        for frame_obstacles in self.history:
-            for obs in frame_obstacles:
-                cx, cy = obs['center']
-                # Round position to grid (allow small movement)
-                grid_x = round(cx / 30) * 30
-                grid_y = round(cy / 30) * 30
-                key = (grid_x, grid_y)
-                
-                if key not in position_map:
-                    position_map[key] = []
-                position_map[key].append(obs)
-        
-        # Keep only obstacles detected MIN_DETECTIONS_REQUIRED times
-        stable_obstacles = []
-        for key, detections in position_map.items():
-            if len(detections) >= Config.MIN_DETECTIONS_REQUIRED:
-                # Use most recent detection
-                stable_obstacles.append(detections[-1])
-        
-        return stable_obstacles
+        # Keep obstacles seen in multiple frames
+        stable = [v[-1] for v in position_map.values() if len(v) >= Config.MIN_DETECTIONS_REQUIRED]
+        return stable
 
 # ----------------------------
-# Motor controller
+# Smart motor decision logic
 # ----------------------------
 class SmartMotorController:
     def __init__(self):
-        self.state = "STOP"
-        self.last_avoidance_time = 0
-        
-    def decide(self, obstacles, traffic_light):
-        current_time = time.time()
-        
-        if traffic_light == "RED":
-            self._execute_stop()
+        self.motors = MotorController()
+
+    def decide(self, obstacles):
+        if not obstacles:
+            self.motors.forward()
             return
         
-        if obstacles:
-            closest = obstacles[0]
-            proximity = closest['proximity']
-            
-            if proximity >= Config.CRITICAL_PROXIMITY:
-                if current_time - self.last_avoidance_time > 2.0:
-                    self._execute_avoidance(closest)
-                    self.last_avoidance_time = current_time
-                return
-            
-            elif proximity >= Config.WARNING_PROXIMITY:
-                self._execute_stop()
-                return
-        
-        if traffic_light == "ORANGE":
-            self._execute_stop()
-            return
-        
-        if traffic_light == "GREEN" or traffic_light is None:
-            if not obstacles or obstacles[0]['proximity'] < Config.SAFE_PROXIMITY:
-                self._execute_forward()
-    
-    def _execute_stop(self):
-        if self.state != "STOP":
-            stop()
-            self.state = "STOP"
-    
-    def _execute_forward(self):
-        if self.state != "FORWARD":
-            forward()
-            self.state = "FORWARD"
-    
-    def _execute_avoidance(self, obstacle):
-        cx = obstacle['center'][0]
-        proximity = obstacle['proximity']
-        
-        print(f"[AVOIDANCE] Proximity: {proximity}%")
-        
-        stop()
-        time.sleep(0.2)
-        
-        if cx < Config.FRAME_WIDTH // 2:
-            right()
-            print("[AVOIDANCE] RIGHT")
+        closest = obstacles[0]
+        x_center = closest['center'][0]
+        proximity = closest['proximity']
+
+        if proximity >= Config.CRITICAL_PROXIMITY:
+            if x_center < Config.FRAME_WIDTH / 3:
+                self.motors.right()
+            elif x_center > Config.FRAME_WIDTH * 2 / 3:
+                self.motors.left()
+            else:
+                self.motors.stop()
+        elif proximity >= Config.WARNING_PROXIMITY:
+            self.motors.stop()
         else:
-            left()
-            print("[AVOIDANCE] LEFT")
-        
-        time.sleep(0.4)
-        stop()
-        self.state = "STOP"
+            self.motors.forward()
 
 # ----------------------------
 # Main loop
 # ----------------------------
 def main():
-    print("[SYSTEM] Initializing Accurate ADAS...")
-    
+    print("[SYSTEM] Starting Enhanced ADAS with All-Object Detection...")
     camera = ThreadedCamera(Config.FRAME_WIDTH, Config.FRAME_HEIGHT)
-    
-    obstacle_detector = AccurateObstacleDetector()
-    traffic_light_detector = OptimizedTrafficLightDetector()
-    obstacle_tracker = StrictObstacleTracker(Config.OBSTACLE_HISTORY_SIZE)
-    motor_controller = SmartMotorController()
-    
-    print("[SYSTEM] ============================================")
-    print("[SYSTEM] High-Accuracy ADAS System")
-    print("[SYSTEM] Strict filtering enabled")
-    print("[SYSTEM] Temporal tracking: Must appear in 3/4 frames")
-    print("[SYSTEM] Press 'q' to quit, 'd' for debug view")
-    print("[SYSTEM] ============================================")
-    
+    detector = EnhancedObstacleDetector()
+    tracker = StrictObstacleTracker(Config.OBSTACLE_HISTORY_SIZE)
+    controller = SmartMotorController()
+
+    show_debug = False
     fps_time = time.time()
     fps_counter = 0
     current_fps = 0
-    show_debug = False
-    
+
     try:
         while True:
             frame = camera.read()
             if frame is None:
                 continue
             
-            # Detect obstacles
-            obstacles, debug_mask = obstacle_detector.detect(frame)
-            obstacle_tracker.update(obstacles)
-            stable_obstacles = obstacle_tracker.get_stable_obstacles()
-            
-            # Detect traffic lights
-            traffic_light = traffic_light_detector.detect(frame)
-            
-            # Make decision
-            motor_controller.decide(stable_obstacles, traffic_light)
-            
-            # Visualization
+            obstacles, mask = detector.detect(frame)
+            tracker.update(obstacles)
+            stable = tracker.get_stable_obstacles()
+            controller.decide(stable)
+
             display = frame.copy()
-            
-            # Draw ROI boundary
-            h, w = display.shape[:2]
-            roi_top = int(h * Config.ROI_TOP_RATIO)
-            roi_left = int(w * Config.ROI_LEFT_RATIO)
-            roi_right = int(w * Config.ROI_RIGHT_RATIO)
-            cv2.rectangle(display, (roi_left, roi_top), 
-                         (roi_right, int(h * Config.ROI_BOTTOM_RATIO)), 
-                         (255, 255, 0), 1)
-            
-            # Draw stable obstacles only
-            for obs in stable_obstacles[:5]:
+            for obs in stable:
                 x, y, w_rect, h_rect = obs['bbox']
-                proximity = obs['proximity']
-                
-                level, color = ProximityEstimator.proximity_to_level(proximity)
-                
-                cv2.rectangle(display, (x, y), (x+w_rect, y+h_rect), color, 2)
-                
-                # Label
-                label = f"{proximity}% {level}"
-                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
-                cv2.rectangle(display, (x, y-label_size[1]-5), 
-                             (x+label_size[0]+4, y), color, -1)
-                cv2.putText(display, label, (x+2, y-5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                
-                # Draw quality metrics (optional)
-                metrics = f"S:{obs['solidity']:.2f} E:{obs['extent']:.2f}"
-                cv2.putText(display, metrics, (x, y+h_rect+12),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
-            
-            # Traffic light
-            if traffic_light:
-                tl_color = (0, 0, 255) if traffic_light == "RED" else \
-                          (0, 165, 255) if traffic_light == "ORANGE" else (0, 255, 0)
-                cv2.circle(display, (25, 25), 12, tl_color, -1)
-                cv2.circle(display, (25, 25), 12, (255, 255, 255), 2)
-            
-            # FPS
+                level, color = ProximityEstimator.proximity_to_level(obs['proximity'])
+                cv2.rectangle(display, (x, y), (x + w_rect, y + h_rect), color, 2)
+                cv2.putText(display, f"{obs['proximity']}% {level}", (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
             fps_counter += 1
             if time.time() - fps_time > 1.0:
                 current_fps = fps_counter
                 fps_counter = 0
                 fps_time = time.time()
-            
-            # Status
-            status_bg = np.zeros((50, w, 3), dtype=np.uint8)
-            cv2.putText(status_bg, f"FPS:{current_fps}", (5, 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.putText(status_bg, f"Detected:{len(obstacles)} Stable:{len(stable_obstacles)}", 
-                       (5, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-            cv2.putText(status_bg, f"{motor_controller.state}", (150, 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-            
-            if stable_obstacles:
-                closest = stable_obstacles[0]
-                level, prox_color = ProximityEstimator.proximity_to_level(closest['proximity'])
-                cv2.putText(status_bg, f"{level}:{closest['proximity']}%", (280, 25),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, prox_color, 1)
-            
-            display[-50:, :] = cv2.addWeighted(display[-50:, :], 0.3, status_bg, 0.7, 0)
-            
-            cv2.imshow("ADAS - Accurate Detection", display)
-            
-            # Debug view
-            if show_debug and debug_mask is not None:
-                debug_resized = cv2.resize(debug_mask, (320, 240))
-                cv2.imshow("Debug - Detection Mask", debug_resized)
-            
+
+            cv2.putText(display, f"FPS:{current_fps} Det:{len(obstacles)} Stable:{len(stable)}",
+                        (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imshow("ADAS - Enhanced Detection", display)
+
+            if show_debug:
+                debug_resized = cv2.resize(mask, (320, 240))
+                cv2.imshow("Debug Mask", debug_resized)
+
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('d'):
                 show_debug = not show_debug
                 if not show_debug:
-                    cv2.destroyWindow("Debug - Detection Mask")
-            
+                    cv2.destroyWindow("Debug Mask")
+
     except KeyboardInterrupt:
         print("\n[SYSTEM] Interrupted")
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        import traceback
-        traceback.print_exc()
     finally:
         camera.release()
         cv2.destroyAllWindows()
-        stop()
+        controller.motors.stop()
         print("[SYSTEM] Shutdown complete")
 
 if __name__ == "__main__":
