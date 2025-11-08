@@ -32,18 +32,14 @@ class Config:
     FRAME_HEIGHT = 360
     FPS = 30
     
-    # Distance estimation calibration (adjust based on your setup)
-    FOCAL_LENGTH = 500  # Calibration constant
-    KNOWN_OBJECT_WIDTH = 20  # Average obstacle width in cm
-    
     # Obstacle detection
     MIN_OBSTACLE_AREA = 800
     MAX_OBSTACLE_AREA = 60000
     
-    # Distance thresholds (in cm)
-    CRITICAL_DISTANCE = 30  # Very close
-    WARNING_DISTANCE = 60   # Need to slow
-    SAFE_DISTANCE = 100     # Just monitoring
+    # Proximity thresholds (0-100 scale, higher = closer)
+    CRITICAL_PROXIMITY = 70   # Very close - emergency stop
+    WARNING_PROXIMITY = 50    # Close - slow down
+    SAFE_PROXIMITY = 30       # Medium - monitor
     
     # ROI settings
     ROI_TOP_RATIO = 0.30
@@ -117,38 +113,51 @@ class ThreadedCamera:
         self.picam2.stop()
 
 # ----------------------------
-# Distance estimation
+# Relative proximity estimation (more reliable)
 # ----------------------------
-class DistanceEstimator:
-    """Estimate distance to obstacles using perspective"""
+class ProximityEstimator:
+    """Estimate relative proximity using area + position"""
     
     @staticmethod
-    def estimate_from_bbox(bbox, frame_height):
-        """Estimate distance based on bounding box size and position"""
+    def calculate_proximity(bbox, area, frame_height):
+        """Calculate proximity score (0-100, higher = closer/more dangerous)"""
         x, y, w, h = bbox
         
-        # Method 1: Based on object height (more accurate)
-        # Objects further away appear smaller
-        if h > 0:
-            # Simple inverse relationship: distance ∝ 1/height
-            distance_height = (Config.FOCAL_LENGTH * Config.KNOWN_OBJECT_WIDTH) / h
-        else:
-            distance_height = 999
+        # Factor 1: Object size (area) - larger = closer
+        # Normalize area to 0-100 scale
+        area_score = min(100, (area / Config.MAX_OBSTACLE_AREA) * 150)
         
-        # Method 2: Based on vertical position in frame
-        # Objects lower in frame are closer
+        # Factor 2: Vertical position - lower in frame = closer
         y_center = y + h/2
-        frame_bottom = frame_height * Config.ROI_BOTTOM_RATIO
-        normalized_y = (frame_bottom - y_center) / frame_bottom
-        distance_position = 150 * normalized_y  # Scale to reasonable range
+        roi_height = frame_height * (Config.ROI_BOTTOM_RATIO - Config.ROI_TOP_RATIO)
+        roi_start = frame_height * Config.ROI_TOP_RATIO
+        normalized_y = (y_center - roi_start) / roi_height
+        position_score = (1 - normalized_y) * 100
         
-        # Weighted average of both methods
-        distance = (distance_height * 0.7) + (distance_position * 0.3)
+        # Factor 3: Width - wider objects are closer
+        width_score = min(100, (w / Config.FRAME_WIDTH) * 200)
         
-        # Clamp to reasonable range
-        distance = max(10, min(200, distance))
+        # Weighted combination
+        proximity = (area_score * 0.5) + (position_score * 0.3) + (width_score * 0.2)
         
-        return int(distance)
+        # Clamp to 0-100
+        proximity = max(0, min(100, proximity))
+        
+        return int(proximity)
+    
+    @staticmethod
+    def proximity_to_level(proximity):
+        """Convert proximity score to readable level"""
+        if proximity >= 75:
+            return "VERY CLOSE", (0, 0, 255)  # Red
+        elif proximity >= 55:
+            return "CLOSE", (0, 100, 255)  # Orange-Red
+        elif proximity >= 35:
+            return "MEDIUM", (0, 165, 255)  # Orange
+        elif proximity >= 20:
+            return "FAR", (0, 255, 255)  # Yellow
+        else:
+            return "VERY FAR", (0, 255, 0)  # Green
 
 # ----------------------------
 # Ultra-fast obstacle detector
@@ -225,10 +234,10 @@ class UltraFastObstacleDetector:
                     w_orig = int(w_rect * scale_factor)
                     h_orig = int(h_rect * scale_factor)
                     
-                    # Calculate distance
-                    bbox_roi = (x_orig - roi_top, y_orig - roi_top, w_orig, h_orig)
-                    distance = DistanceEstimator.estimate_from_bbox(
-                        (x_orig, y_orig - roi_top, w_orig, h_orig), 
+                    # Calculate proximity score (0-100)
+                    proximity = ProximityEstimator.calculate_proximity(
+                        (x_orig, y_orig, w_orig, h_orig),
+                        area * (scale_factor ** 2),
                         h
                     )
                     
@@ -236,28 +245,19 @@ class UltraFastObstacleDetector:
                     cx = x_orig + w_orig // 2
                     cy = y_orig + h_orig // 2
                     
-                    # Determine criticality based on distance
-                    if distance < Config.CRITICAL_DISTANCE:
-                        criticality = 100
-                    elif distance < Config.WARNING_DISTANCE:
-                        criticality = 70 - ((distance - Config.CRITICAL_DISTANCE) / 
-                                           (Config.WARNING_DISTANCE - Config.CRITICAL_DISTANCE) * 40)
-                    elif distance < Config.SAFE_DISTANCE:
-                        criticality = 30 - ((distance - Config.WARNING_DISTANCE) / 
-                                           (Config.SAFE_DISTANCE - Config.WARNING_DISTANCE) * 20)
-                    else:
-                        criticality = 10
+                    # Determine criticality based on proximity
+                    criticality = proximity
                     
                     obstacles.append({
                         'bbox': (x_orig, y_orig, w_orig, h_orig),
                         'area': area * (scale_factor ** 2),
                         'center': (cx, cy),
-                        'distance': distance,
+                        'proximity': proximity,
                         'criticality': criticality
                     })
         
-        # Sort by distance (closest first)
-        obstacles.sort(key=lambda x: x['distance'])
+        # Sort by proximity (closest first)
+        obstacles.sort(key=lambda x: x['proximity'], reverse=True)
         
         return obstacles[:8], combined  # Return top 8
 
@@ -340,7 +340,7 @@ class FastObstacleTracker:
         return self.history[-1]  # Just return latest for speed
 
 # ----------------------------
-# Motor controller with distance-based logic
+# Motor controller with proximity-based logic
 # ----------------------------
 class SmartMotorController:
     def __init__(self):
@@ -355,20 +355,20 @@ class SmartMotorController:
             self._execute_stop()
             return
         
-        # Priority 2: Obstacles by distance
+        # Priority 2: Obstacles by proximity
         if obstacles:
             closest = obstacles[0]
-            distance = closest['distance']
+            proximity = closest['proximity']
             
-            if distance < Config.CRITICAL_DISTANCE:
-                # Emergency avoidance
+            if proximity >= Config.CRITICAL_PROXIMITY:
+                # Emergency avoidance - very close!
                 if current_time - self.last_avoidance_time > 1.5:
                     self._execute_avoidance(closest)
                     self.last_avoidance_time = current_time
                 return
             
-            elif distance < Config.WARNING_DISTANCE:
-                # Slow down / stop
+            elif proximity >= Config.WARNING_PROXIMITY:
+                # Close - stop and wait
                 self._execute_stop()
                 return
         
@@ -379,7 +379,7 @@ class SmartMotorController:
         
         # Clear path - go forward
         if traffic_light == "GREEN" or traffic_light is None:
-            if not obstacles or obstacles[0]['distance'] > Config.SAFE_DISTANCE:
+            if not obstacles or obstacles[0]['proximity'] < Config.SAFE_PROXIMITY:
                 self._execute_forward()
     
     def _execute_stop(self):
@@ -394,9 +394,9 @@ class SmartMotorController:
     
     def _execute_avoidance(self, obstacle):
         cx = obstacle['center'][0]
-        distance = obstacle['distance']
+        proximity = obstacle['proximity']
         
-        print(f"[AVOIDANCE] Distance: {distance}cm")
+        print(f"[AVOIDANCE] Proximity: {proximity}% (VERY CLOSE!)")
         
         stop()
         time.sleep(0.15)
@@ -430,7 +430,8 @@ def main():
     print("[SYSTEM] ============================================")
     print("[SYSTEM] Ultra-Fast ADAS System Ready")
     print("[SYSTEM] Resolution: {}x{}".format(Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
-    print("[SYSTEM] Distance Estimation: ENABLED")
+    print("[SYSTEM] Proximity Detection: ENABLED (0-100 scale)")
+    print("[SYSTEM] Note: Using relative proximity, not absolute distance")
     print("[SYSTEM] Press 'q' to quit")
     print("[SYSTEM] ============================================")
     
@@ -461,28 +462,23 @@ def main():
             # Draw visualization
             display = frame.copy()
             
-            # Draw obstacles with distance
+            # Draw obstacles with proximity
             for i, obs in enumerate(stable_obstacles[:5]):  # Show top 5
                 x, y, w, h = obs['bbox']
-                distance = obs['distance']
+                proximity = obs['proximity']
                 
-                # Color by distance
-                if distance < Config.CRITICAL_DISTANCE:
-                    color = (0, 0, 255)  # Red
-                elif distance < Config.WARNING_DISTANCE:
-                    color = (0, 165, 255)  # Orange
-                else:
-                    color = (0, 255, 0)  # Green
+                # Get level and color
+                level, color = ProximityEstimator.proximity_to_level(proximity)
                 
                 cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
                 
-                # Distance label
-                label = f"{distance}cm"
+                # Proximity label with level
+                label = f"{proximity}% {level}"
                 (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 
-                                                         0.5, 2)
-                cv2.rectangle(display, (x, y-label_h-5), (x+label_w, y), color, -1)
-                cv2.putText(display, label, (x, y-5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                                                         0.45, 1)
+                cv2.rectangle(display, (x, y-label_h-5), (x+label_w+5, y), color, -1)
+                cv2.putText(display, label, (x+2, y-5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             
             # Traffic light indicator
             if traffic_light:
@@ -513,9 +509,10 @@ def main():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
             
             if stable_obstacles:
-                closest_dist = stable_obstacles[0]['distance']
-                cv2.putText(status_bg, f"CLOSEST:{closest_dist}cm", (250, 24),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                closest_prox = stable_obstacles[0]['proximity']
+                level, prox_color = ProximityEstimator.proximity_to_level(closest_prox)
+                cv2.putText(status_bg, f"{level}:{closest_prox}%", (230, 24),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, prox_color, 1)
             
             display[-40:, :] = cv2.addWeighted(display[-40:, :], 0.3, status_bg, 0.7, 0)
             
