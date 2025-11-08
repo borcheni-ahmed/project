@@ -27,48 +27,59 @@ def backward():
 # Configuration
 # ----------------------------
 class Config:
-    # Camera settings
-    FRAME_WIDTH = 640
-    FRAME_HEIGHT = 480
+    # Camera settings (reduced for performance)
+    FRAME_WIDTH = 480
+    FRAME_HEIGHT = 360
     FPS = 30
     
+    # Distance estimation calibration (adjust based on your setup)
+    FOCAL_LENGTH = 500  # Calibration constant
+    KNOWN_OBJECT_WIDTH = 20  # Average obstacle width in cm
+    
     # Obstacle detection
-    MIN_OBSTACLE_AREA = 1000
-    MAX_OBSTACLE_AREA = 80000
-    CRITICAL_DISTANCE_THRESHOLD = 25000
-    SAFE_DISTANCE_THRESHOLD = 12000
+    MIN_OBSTACLE_AREA = 800
+    MAX_OBSTACLE_AREA = 60000
+    
+    # Distance thresholds (in cm)
+    CRITICAL_DISTANCE = 30  # Very close
+    WARNING_DISTANCE = 60   # Need to slow
+    SAFE_DISTANCE = 100     # Just monitoring
     
     # ROI settings
-    ROI_TOP_RATIO = 0.35
+    ROI_TOP_RATIO = 0.30
     ROI_BOTTOM_RATIO = 0.95
     
-    # Traffic light detection (strict)
-    MIN_CIRCULARITY = 0.65
-    MIN_LIGHT_AREA = 150
-    MAX_LIGHT_AREA = 4000
+    # Traffic light detection
+    MIN_CIRCULARITY = 0.6
+    MIN_LIGHT_AREA = 120
+    MAX_LIGHT_AREA = 3000
     
-    # History for stability
-    OBSTACLE_HISTORY_SIZE = 3
-    LIGHT_HISTORY_SIZE = 3
+    # Performance optimization
+    SKIP_FRAMES = 0  # Process every frame now
+    RESIZE_FOR_DETECTION = True  # Process smaller frame
+    DETECTION_SCALE = 0.7  # Scale down for detection
     
-    # Performance
-    SKIP_FRAMES = 1  # Process every N frames
+    # History
+    OBSTACLE_HISTORY_SIZE = 2
+    LIGHT_HISTORY_SIZE = 2
 
 # ----------------------------
-# Threaded camera capture for better performance
+# High-performance threaded camera
 # ----------------------------
 class ThreadedCamera:
-    def __init__(self, width=640, height=480):
+    def __init__(self, width=480, height=360):
         self.picam2 = Picamera2()
         
-        # Optimized configuration
+        # Optimized low-latency configuration
         config = self.picam2.create_preview_configuration(
             main={"size": (width, height), "format": "RGB888"},
-            buffer_count=2,  # Reduce buffer for less latency
+            buffer_count=2,
+            queue=False,  # Non-blocking
             controls={
                 "AwbEnable": True,
                 "AeEnable": True,
                 "FrameRate": Config.FPS,
+                "NoiseReductionMode": 0,  # Disable for speed
             }
         )
         self.picam2.configure(config)
@@ -78,95 +89,125 @@ class ThreadedCamera:
         self.lock = Lock()
         self.running = True
         
-        # Start capture thread
+        # Start high-priority capture thread
         self.thread = Thread(target=self._update, daemon=True)
         self.thread.start()
         
-        # Warm up
-        time.sleep(2)
+        time.sleep(1.5)
     
     def _update(self):
-        """Continuously capture frames in background"""
+        """Continuously capture frames"""
         while self.running:
             try:
                 new_frame = self.picam2.capture_array()
+                # Convert RGB to BGR immediately
+                bgr_frame = cv2.cvtColor(new_frame, cv2.COLOR_RGB2BGR)
                 with self.lock:
-                    # Convert RGB to BGR (OpenCV format) - THIS FIXES COLOR SWAP!
-                    self.frame = cv2.cvtColor(new_frame, cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                print(f"[CAMERA ERROR] {e}")
-                time.sleep(0.1)
+                    self.frame = bgr_frame
+            except:
+                time.sleep(0.01)
     
     def read(self):
-        """Get latest frame"""
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
     
     def release(self):
-        """Stop camera"""
         self.running = False
         self.thread.join()
         self.picam2.stop()
 
 # ----------------------------
-# Fast color correction
+# Distance estimation
 # ----------------------------
-def correct_colors_fast(frame):
-    """Lightweight color correction"""
-    # Simple brightness and contrast adjustment
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+class DistanceEstimator:
+    """Estimate distance to obstacles using perspective"""
     
-    # Fast CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    
-    lab = cv2.merge([l, a, b])
-    corrected = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    
-    return corrected
+    @staticmethod
+    def estimate_from_bbox(bbox, frame_height):
+        """Estimate distance based on bounding box size and position"""
+        x, y, w, h = bbox
+        
+        # Method 1: Based on object height (more accurate)
+        # Objects further away appear smaller
+        if h > 0:
+            # Simple inverse relationship: distance ∝ 1/height
+            distance_height = (Config.FOCAL_LENGTH * Config.KNOWN_OBJECT_WIDTH) / h
+        else:
+            distance_height = 999
+        
+        # Method 2: Based on vertical position in frame
+        # Objects lower in frame are closer
+        y_center = y + h/2
+        frame_bottom = frame_height * Config.ROI_BOTTOM_RATIO
+        normalized_y = (frame_bottom - y_center) / frame_bottom
+        distance_position = 150 * normalized_y  # Scale to reasonable range
+        
+        # Weighted average of both methods
+        distance = (distance_height * 0.7) + (distance_position * 0.3)
+        
+        # Clamp to reasonable range
+        distance = max(10, min(200, distance))
+        
+        return int(distance)
 
 # ----------------------------
-# Optimized obstacle detection
+# Ultra-fast obstacle detector
 # ----------------------------
-class FastObstacleDetector:
+class UltraFastObstacleDetector:
     def __init__(self):
+        # Background subtractor with optimized settings
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=300, varThreshold=25, detectShadows=False
+            history=200, varThreshold=30, detectShadows=False
         )
-        self.frame_count = 0
+        self.kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self.kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         
     def detect(self, frame):
-        """Lightweight obstacle detection"""
-        self.frame_count += 1
-        
+        """Ultra-fast multi-method obstacle detection with distance"""
         h, w = frame.shape[:2]
+        
+        # Define ROI
         roi_top = int(h * Config.ROI_TOP_RATIO)
         roi_bottom = int(h * Config.ROI_BOTTOM_RATIO)
-        
         roi = frame[roi_top:roi_bottom, :]
+        roi_h = roi.shape[0]
+        
+        # Optionally resize for faster processing
+        if Config.RESIZE_FOR_DETECTION:
+            process_roi = cv2.resize(roi, None, fx=Config.DETECTION_SCALE, 
+                                     fy=Config.DETECTION_SCALE, 
+                                     interpolation=cv2.INTER_LINEAR)
+            scale_factor = 1.0 / Config.DETECTION_SCALE
+        else:
+            process_roi = roi
+            scale_factor = 1.0
         
         # Convert to grayscale
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(process_roi, cv2.COLOR_BGR2GRAY)
         
-        # Method 1: Simple edge detection (fast)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 40, 120)
+        # Method 1: Fast edge detection
+        edges = cv2.Canny(gray, 30, 100)
         
-        # Method 2: Background subtraction
-        fg_mask = self.bg_subtractor.apply(roi, learningRate=0.005)
-        _, motion = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+        # Method 2: Background subtraction (motion)
+        fg_mask = self.bg_subtractor.apply(process_roi, learningRate=0.003)
+        _, motion = cv2.threshold(fg_mask, 220, 255, cv2.THRESH_BINARY)
         
-        # Combine
+        # Method 3: Adaptive thresholding for static objects
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 7, 2)
+        
+        # Combine all methods
         combined = cv2.bitwise_or(edges, motion)
+        combined = cv2.bitwise_or(combined, thresh)
         
-        # Quick morphological cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # Quick cleanup
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, self.kernel_small)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, self.kernel_small)
+        combined = cv2.dilate(combined, self.kernel_medium, iterations=1)
         
         # Find contours
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, 
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, hierarchy = cv2.findContours(combined, cv2.RETR_EXTERNAL, 
+                                               cv2.CHAIN_APPROX_SIMPLE)
         
         obstacles = []
         for contour in contours:
@@ -175,162 +216,170 @@ class FastObstacleDetector:
             if Config.MIN_OBSTACLE_AREA < area < Config.MAX_OBSTACLE_AREA:
                 x, y, w_rect, h_rect = cv2.boundingRect(contour)
                 
-                # Quick aspect ratio check
+                # Aspect ratio filter
                 aspect = w_rect / float(h_rect) if h_rect > 0 else 0
-                if 0.2 < aspect < 5.0:
-                    cx = x + w_rect // 2
-                    cy = y + h_rect // 2
+                if 0.15 < aspect < 6.0:
+                    # Scale back to original coordinates
+                    x_orig = int(x * scale_factor)
+                    y_orig = int(y * scale_factor) + roi_top
+                    w_orig = int(w_rect * scale_factor)
+                    h_orig = int(h_rect * scale_factor)
                     
-                    # Simple criticality
-                    area_score = min(100, (area / Config.CRITICAL_DISTANCE_THRESHOLD) * 100)
-                    position_score = ((roi.shape[0] - cy) / roi.shape[0]) * 100
-                    criticality = (area_score * 0.7) + (position_score * 0.3)
+                    # Calculate distance
+                    bbox_roi = (x_orig - roi_top, y_orig - roi_top, w_orig, h_orig)
+                    distance = DistanceEstimator.estimate_from_bbox(
+                        (x_orig, y_orig - roi_top, w_orig, h_orig), 
+                        h
+                    )
+                    
+                    # Calculate center
+                    cx = x_orig + w_orig // 2
+                    cy = y_orig + h_orig // 2
+                    
+                    # Determine criticality based on distance
+                    if distance < Config.CRITICAL_DISTANCE:
+                        criticality = 100
+                    elif distance < Config.WARNING_DISTANCE:
+                        criticality = 70 - ((distance - Config.CRITICAL_DISTANCE) / 
+                                           (Config.WARNING_DISTANCE - Config.CRITICAL_DISTANCE) * 40)
+                    elif distance < Config.SAFE_DISTANCE:
+                        criticality = 30 - ((distance - Config.WARNING_DISTANCE) / 
+                                           (Config.SAFE_DISTANCE - Config.WARNING_DISTANCE) * 20)
+                    else:
+                        criticality = 10
                     
                     obstacles.append({
-                        'bbox': (x, y + roi_top, w_rect, h_rect),
-                        'area': area,
-                        'center': (cx, cy + roi_top),
+                        'bbox': (x_orig, y_orig, w_orig, h_orig),
+                        'area': area * (scale_factor ** 2),
+                        'center': (cx, cy),
+                        'distance': distance,
                         'criticality': criticality
                     })
         
-        obstacles.sort(key=lambda x: x['criticality'], reverse=True)
-        return obstacles[:5]  # Return top 5 only
+        # Sort by distance (closest first)
+        obstacles.sort(key=lambda x: x['distance'])
+        
+        return obstacles[:8], combined  # Return top 8
 
 # ----------------------------
-# Fixed traffic light detection
+# Optimized traffic light detector
 # ----------------------------
-class FastTrafficLightDetector:
+class OptimizedTrafficLightDetector:
     def __init__(self):
         self.light_history = deque(maxlen=Config.LIGHT_HISTORY_SIZE)
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         
     def detect(self, frame):
-        """Detect traffic lights with CORRECT BGR colors"""
+        """Fast traffic light detection"""
         h, w = frame.shape[:2]
-        roi = frame[0:h//2, w//4:3*w//4]  # Focus on center-top
         
-        # Convert BGR to HSV
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        # Small ROI for traffic lights (top-center)
+        roi = frame[0:h//3, w//3:2*w//3]
         
-        # Detect each color
-        red_score = self._detect_color(hsv, "RED")
-        orange_score = self._detect_color(hsv, "ORANGE")
-        green_score = self._detect_color(hsv, "GREEN")
+        # Downsample for speed
+        roi_small = cv2.resize(roi, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_LINEAR)
+        hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
         
-        # Determine which light is active
-        detected_state = None
-        max_score = max(red_score, orange_score, green_score)
+        # Quick color detection
+        scores = {
+            "RED": self._quick_detect(hsv, "RED"),
+            "ORANGE": self._quick_detect(hsv, "ORANGE"),
+            "GREEN": self._quick_detect(hsv, "GREEN")
+        }
         
-        if max_score > 200:  # Minimum pixels threshold
-            if red_score == max_score:
-                detected_state = "RED"
-            elif orange_score == max_score:
-                detected_state = "ORANGE"
-            elif green_score == max_score:
-                detected_state = "GREEN"
+        # Get highest score
+        max_score = max(scores.values())
+        detected = None
         
-        # Add to history
-        self.light_history.append(detected_state)
+        if max_score > 100:
+            detected = max(scores, key=scores.get)
         
-        # Return only if consistent
+        # History smoothing
+        self.light_history.append(detected)
+        
         if len(self.light_history) >= 2:
-            non_none = [s for s in list(self.light_history)[-2:] if s is not None]
-            if len(non_none) >= 2 and non_none[0] == non_none[1]:
-                return non_none[0]
+            recent = list(self.light_history)[-2:]
+            non_none = [x for x in recent if x is not None]
+            if len(non_none) >= 1:
+                return non_none[-1]
         
         return None
     
-    def _detect_color(self, hsv, color):
-        """Detect specific color and check circularity"""
+    def _quick_detect(self, hsv, color):
+        """Fast color detection with circularity check"""
         if color == "RED":
-            # Red wraps around in HSV (0-10 and 170-180)
-            mask1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255]))
+            mask1 = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+            mask2 = cv2.inRange(hsv, (170, 80, 80), (180, 255, 255))
             mask = cv2.bitwise_or(mask1, mask2)
         elif color == "ORANGE":
-            # Orange/Yellow range
-            mask = cv2.inRange(hsv, np.array([10, 100, 100]), np.array([25, 255, 255]))
-        else:  # GREEN
-            mask = cv2.inRange(hsv, np.array([40, 50, 50]), np.array([80, 255, 255]))
+            mask = cv2.inRange(hsv, (8, 80, 80), (25, 255, 255))
+        else:
+            mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
         
-        # Clean up mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        # Quick cleanup
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         
-        # Find circular contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Count pixels (faster than finding contours for scoring)
+        score = cv2.countNonZero(mask)
         
-        total_score = 0
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            
-            if Config.MIN_LIGHT_AREA < area < Config.MAX_LIGHT_AREA:
-                perimeter = cv2.arcLength(contour, True)
-                if perimeter > 0:
-                    circularity = 4 * np.pi * area / (perimeter * perimeter)
-                    
-                    if circularity > Config.MIN_CIRCULARITY:
-                        total_score += area
-        
-        return total_score
+        return score
 
 # ----------------------------
-# Obstacle tracker
+# Lightweight tracker
 # ----------------------------
-class ObstacleTracker:
-    def __init__(self, history_size=3):
+class FastObstacleTracker:
+    def __init__(self, history_size=2):
         self.history = deque(maxlen=history_size)
     
     def update(self, obstacles):
         self.history.append(obstacles)
     
     def get_stable_obstacles(self):
-        if len(self.history) < 2:
+        if not self.history:
             return []
-        
-        if all(len(obs) > 0 for obs in self.history):
-            return self.history[-1]
-        
-        return []
+        return self.history[-1]  # Just return latest for speed
 
 # ----------------------------
-# Motor controller
+# Motor controller with distance-based logic
 # ----------------------------
-class MotorController:
+class SmartMotorController:
     def __init__(self):
         self.state = "STOP"
-        self.avoidance_count = 0
         self.last_avoidance_time = 0
         
     def decide(self, obstacles, traffic_light):
         current_time = time.time()
         
-        # Red light = stop
+        # Priority 1: Red light
         if traffic_light == "RED":
             self._execute_stop()
             return
         
-        # Critical obstacle
+        # Priority 2: Obstacles by distance
         if obstacles:
-            most_critical = obstacles[0]
+            closest = obstacles[0]
+            distance = closest['distance']
             
-            if most_critical['criticality'] > 60:
-                if current_time - self.last_avoidance_time > 2.0:
-                    self._execute_avoidance(most_critical)
+            if distance < Config.CRITICAL_DISTANCE:
+                # Emergency avoidance
+                if current_time - self.last_avoidance_time > 1.5:
+                    self._execute_avoidance(closest)
                     self.last_avoidance_time = current_time
                 return
             
-            elif most_critical['criticality'] > 35:
+            elif distance < Config.WARNING_DISTANCE:
+                # Slow down / stop
                 self._execute_stop()
                 return
         
-        # Orange light
+        # Priority 3: Orange light
         if traffic_light == "ORANGE":
             self._execute_stop()
             return
         
-        # Green or clear - go
+        # Clear path - go forward
         if traffic_light == "GREEN" or traffic_light is None:
-            if not obstacles:
+            if not obstacles or obstacles[0]['distance'] > Config.SAFE_DISTANCE:
                 self._execute_forward()
     
     def _execute_stop(self):
@@ -345,135 +394,137 @@ class MotorController:
     
     def _execute_avoidance(self, obstacle):
         cx = obstacle['center'][0]
-        frame_center = Config.FRAME_WIDTH // 2
+        distance = obstacle['distance']
         
-        print(f"[AVOIDANCE] Criticality: {obstacle['criticality']:.1f}")
+        print(f"[AVOIDANCE] Distance: {distance}cm")
         
         stop()
-        time.sleep(0.2)
+        time.sleep(0.15)
         
-        if cx < frame_center:
+        if cx < Config.FRAME_WIDTH // 2:
             right()
             print("[AVOIDANCE] Steering RIGHT")
         else:
             left()
             print("[AVOIDANCE] Steering LEFT")
         
-        time.sleep(0.4)
+        time.sleep(0.35)
         stop()
         self.state = "STOP"
 
 # ----------------------------
-# Main function (optimized)
+# Main loop (maximum performance)
 # ----------------------------
 def main():
-    # Initialize threaded camera
-    print("[SYSTEM] Starting threaded camera...")
+    print("[SYSTEM] Initializing high-performance ADAS...")
+    
+    # Start camera
     camera = ThreadedCamera(Config.FRAME_WIDTH, Config.FRAME_HEIGHT)
     
     # Initialize detectors
-    obstacle_detector = FastObstacleDetector()
-    traffic_light_detector = FastTrafficLightDetector()
-    obstacle_tracker = ObstacleTracker(Config.OBSTACLE_HISTORY_SIZE)
-    motor_controller = MotorController()
+    obstacle_detector = UltraFastObstacleDetector()
+    traffic_light_detector = OptimizedTrafficLightDetector()
+    obstacle_tracker = FastObstacleTracker(Config.OBSTACLE_HISTORY_SIZE)
+    motor_controller = SmartMotorController()
     
     print("[SYSTEM] ============================================")
-    print("[SYSTEM] ADAS System Started (Optimized)")
-    print("[SYSTEM] BGR Color Fix Applied")
-    print("[SYSTEM] Press 'q' to quit, 's' to save frame")
+    print("[SYSTEM] Ultra-Fast ADAS System Ready")
+    print("[SYSTEM] Resolution: {}x{}".format(Config.FRAME_WIDTH, Config.FRAME_HEIGHT))
+    print("[SYSTEM] Distance Estimation: ENABLED")
+    print("[SYSTEM] Press 'q' to quit")
     print("[SYSTEM] ============================================")
     
-    frame_count = 0
-    fps_start_time = time.time()
+    fps_time = time.time()
     fps_counter = 0
     current_fps = 0
     
     try:
         while True:
-            # Get frame from threaded camera
+            loop_start = time.time()
+            
+            # Get frame
             frame = camera.read()
             if frame is None:
                 continue
             
-            frame_count += 1
-            
-            # Process every N frames for better performance
-            if frame_count % (Config.SKIP_FRAMES + 1) != 0:
-                continue
-            
-            # Light color correction
-            corrected_frame = correct_colors_fast(frame)
-            
-            # Detect obstacles
-            obstacles = obstacle_detector.detect(corrected_frame)
+            # Detect obstacles with distance
+            obstacles, _ = obstacle_detector.detect(frame)
             obstacle_tracker.update(obstacles)
             stable_obstacles = obstacle_tracker.get_stable_obstacles()
             
             # Detect traffic lights
-            traffic_light = traffic_light_detector.detect(corrected_frame)
-            
-            # Draw obstacles
-            display_frame = corrected_frame.copy()
-            for obs in stable_obstacles:
-                x, y, w, h = obs['bbox']
-                criticality = obs['criticality']
-                
-                # Color based on criticality
-                if criticality > 60:
-                    color = (0, 0, 255)  # Red
-                elif criticality > 35:
-                    color = (0, 165, 255)  # Orange
-                else:
-                    color = (0, 255, 255)  # Yellow
-                
-                cv2.rectangle(display_frame, (x, y), (x+w, y+h), color, 2)
-                cv2.putText(display_frame, f"{criticality:.0f}%", (x, y-5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Draw traffic light
-            if traffic_light:
-                tl_color = (0, 0, 255) if traffic_light == "RED" else \
-                          (0, 165, 255) if traffic_light == "ORANGE" else (0, 255, 0)
-                cv2.circle(display_frame, (30, 30), 15, tl_color, -1)
-                cv2.putText(display_frame, traffic_light, (55, 38),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_color, 2)
-            
-            # Draw ROI
-            h = display_frame.shape[0]
-            roi_top = int(h * Config.ROI_TOP_RATIO)
-            cv2.line(display_frame, (0, roi_top), (Config.FRAME_WIDTH, roi_top), 
-                    (255, 0, 0), 1)
-            
-            # FPS calculation
-            fps_counter += 1
-            if time.time() - fps_start_time > 1.0:
-                current_fps = fps_counter
-                fps_counter = 0
-                fps_start_time = time.time()
-            
-            # Status overlay
-            cv2.putText(display_frame, f"FPS: {current_fps}", (10, h-60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(display_frame, f"Obstacles: {len(stable_obstacles)}", (10, h-35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(display_frame, f"State: {motor_controller.state}", (10, h-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            traffic_light = traffic_light_detector.detect(frame)
             
             # Make decision
             motor_controller.decide(stable_obstacles, traffic_light)
             
-            # Display
-            cv2.imshow("ADAS - Optimized View", display_frame)
+            # Draw visualization
+            display = frame.copy()
             
-            # Keyboard
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("\n[SYSTEM] Shutting down...")
+            # Draw obstacles with distance
+            for i, obs in enumerate(stable_obstacles[:5]):  # Show top 5
+                x, y, w, h = obs['bbox']
+                distance = obs['distance']
+                
+                # Color by distance
+                if distance < Config.CRITICAL_DISTANCE:
+                    color = (0, 0, 255)  # Red
+                elif distance < Config.WARNING_DISTANCE:
+                    color = (0, 165, 255)  # Orange
+                else:
+                    color = (0, 255, 0)  # Green
+                
+                cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
+                
+                # Distance label
+                label = f"{distance}cm"
+                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 
+                                                         0.5, 2)
+                cv2.rectangle(display, (x, y-label_h-5), (x+label_w, y), color, -1)
+                cv2.putText(display, label, (x, y-5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            
+            # Traffic light indicator
+            if traffic_light:
+                tl_color = (0, 0, 255) if traffic_light == "RED" else \
+                          (0, 165, 255) if traffic_light == "ORANGE" else (0, 255, 0)
+                cv2.circle(display, (25, 25), 12, tl_color, -1)
+                cv2.circle(display, (25, 25), 12, (255, 255, 255), 2)
+            
+            # ROI line
+            roi_y = int(display.shape[0] * Config.ROI_TOP_RATIO)
+            cv2.line(display, (0, roi_y), (Config.FRAME_WIDTH, roi_y), (255, 255, 0), 1)
+            
+            # FPS counter
+            fps_counter += 1
+            if time.time() - fps_time > 1.0:
+                current_fps = fps_counter
+                fps_counter = 0
+                fps_time = time.time()
+            
+            # Status overlay (compact)
+            h = display.shape[0]
+            status_bg = np.zeros((40, display.shape[1], 3), dtype=np.uint8)
+            cv2.putText(status_bg, f"FPS:{current_fps}", (5, 15),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(status_bg, f"OBS:{len(stable_obstacles)}", (5, 32),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(status_bg, f"{motor_controller.state}", (100, 24),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+            
+            if stable_obstacles:
+                closest_dist = stable_obstacles[0]['distance']
+                cv2.putText(status_bg, f"CLOSEST:{closest_dist}cm", (250, 24),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
+            display[-40:, :] = cv2.addWeighted(display[-40:, :], 0.3, status_bg, 0.7, 0)
+            
+            # Display
+            cv2.imshow("ADAS - Ultra Fast", display)
+            
+            # Check for quit
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-            elif key == ord('s'):
-                filename = f"adas_{int(time.time())}.jpg"
-                cv2.imwrite(filename, display_frame)
-                print(f"[SYSTEM] Saved: {filename}")
             
     except KeyboardInterrupt:
         print("\n[SYSTEM] Interrupted")
@@ -485,7 +536,7 @@ def main():
         camera.release()
         cv2.destroyAllWindows()
         stop()
-        print("[SYSTEM] Cleanup complete")
+        print("[SYSTEM] Shutdown complete")
 
 if __name__ == "__main__":
     main()
